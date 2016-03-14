@@ -331,7 +331,13 @@ private[spark] class CoarseMesosSchedulerBackend(
         logDebug(s"Connecting to shuffle service on slave $slaveId, " +
             s"host $hostname, port $externalShufflePort for app ${conf.getAppId}")
         mesosExternalShuffleClient.get
-          .registerDriverWithShuffleService(hostname, externalShufflePort)
+          .registerDriverWithShuffleService(
+            slave.hostname,
+            externalShufflePort,
+            sc.conf.getTimeAsMs("spark.storage.blockManagerSlaveTimeoutMs",
+              s"${sc.conf.getTimeAsMs("spark.network.timeout", "120s")}ms"),
+            sc.conf.getTimeAsMs("spark.executor.heartbeatInterval", "10s"))
+        slave.shuffleRegistered = true
       }
 
       if (TaskState.isFinished(TaskState.fromMesos(state))) {
@@ -364,7 +370,35 @@ private[spark] class CoarseMesosSchedulerBackend(
   }
 
   override def stop() {
-    super.stop()
+    // Make sure we're not launching tasks during shutdown
+    stateLock.synchronized {
+      if (stopCalled) {
+        logWarning("Stop called multiple times, ignoring")
+        return
+      }
+      stopCalled = true
+      super.stop()
+    }
+
+    // Wait for executors to report done, or else mesosDriver.stop() will forcefully kill them.
+    // See SPARK-12330
+    val startTime = System.nanoTime()
+
+    // slaveIdsWithExecutors has no memory barrier, so this is eventually consistent
+    while (numExecutors() > 0 &&
+      System.nanoTime() - startTime < shutdownTimeoutMS * 1000L * 1000L) {
+      Thread.sleep(100)
+    }
+
+    if (numExecutors() > 0) {
+      logWarning(s"Timed out waiting for ${numExecutors()} remaining executors "
+        + s"to terminate within $shutdownTimeoutMS ms. This may leave temporary files "
+        + "on the mesos nodes.")
+    }
+
+    // Close the mesos external shuffle client if used
+    mesosExternalShuffleClient.foreach(_.close())
+
     if (mesosDriver != null) {
       mesosDriver.stop()
     }
