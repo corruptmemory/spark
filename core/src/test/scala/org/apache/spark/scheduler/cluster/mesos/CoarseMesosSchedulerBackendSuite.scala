@@ -17,20 +17,24 @@
 
 package org.apache.spark.scheduler.cluster.mesos
 
-import java.util
 import java.util.Collections
 
-import org.apache.mesos.Protos.Value.Scalar
-import org.apache.mesos.Protos._
+import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
+
 import org.apache.mesos.{Protos, Scheduler, SchedulerDriver}
+import org.apache.mesos.Protos._
+import org.apache.mesos.Protos.Value.Scalar
+import org.mockito.{ArgumentCaptor, Matchers}
 import org.mockito.Matchers._
 import org.mockito.Mockito._
-import org.mockito.Matchers
 import org.scalatest.mock.MockitoSugar
 import org.scalatest.BeforeAndAfter
 
+import org.apache.spark.{LocalSparkContext, SecurityManager, SparkConf, SparkContext, SparkFunSuite}
+import org.apache.spark.network.shuffle.mesos.MesosExternalShuffleClient
+import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.scheduler.TaskSchedulerImpl
-import org.apache.spark.{LocalSparkContext, SparkConf, SparkContext, SecurityManager, SparkFunSuite}
 
 class CoarseMesosSchedulerBackendSuite extends SparkFunSuite
     with LocalSparkContext
@@ -205,35 +209,6 @@ class CoarseMesosSchedulerBackendSuite extends SparkFunSuite
     verify(driver, times(1)).killTask(createTaskId("0"))
   }
 
-  test("weburi is set in created scheduler driver") {
-    setBackend()
-    val taskScheduler = mock[TaskSchedulerImpl]
-    when(taskScheduler.sc).thenReturn(sc)
-    val driver = mock[SchedulerDriver]
-    when(driver.start()).thenReturn(Protos.Status.DRIVER_RUNNING)
-    val securityManager = mock[SecurityManager]
-
-    val backend = new CoarseMesosSchedulerBackend(taskScheduler, sc, "master", securityManager) {
-      override protected def createSchedulerDriver(
-        masterUrl: String,
-        scheduler: Scheduler,
-        sparkUser: String,
-        appName: String,
-        conf: SparkConf,
-        webuiUrl: Option[String] = None,
-        checkpoint: Option[Boolean] = None,
-        failoverTimeout: Option[Double] = None,
-        frameworkId: Option[String] = None): SchedulerDriver = {
-        markRegistered()
-        assert(webuiUrl.isDefined)
-        assert(webuiUrl.get.equals("http://webui"))
-        driver
-      }
-    }
-
-    backend.start()
-  }
-
   private def verifyDeclinedOffer(driver: SchedulerDriver,
       offerId: OfferID,
       filter: Boolean = false): Unit = {
@@ -294,8 +269,7 @@ class CoarseMesosSchedulerBackendSuite extends SparkFunSuite
       .setName("cpus")
       .setType(Value.Type.SCALAR)
       .setScalar(Scalar.newBuilder().setValue(cpu))
-    builder.setId(OfferID.newBuilder()
-      .setValue(offerId).build())
+    builder.setId(createOfferId(offerId))
       .setFrameworkId(FrameworkID.newBuilder()
         .setValue("f1"))
       .setSlaveId(SlaveID.newBuilder().setValue(slaveId))
@@ -305,130 +279,61 @@ class CoarseMesosSchedulerBackendSuite extends SparkFunSuite
 
   private def createSchedulerBackend(
       taskScheduler: TaskSchedulerImpl,
-      driver: SchedulerDriver): CoarseMesosSchedulerBackend = {
+      driver: SchedulerDriver,
+      shuffleClient: MesosExternalShuffleClient,
+      endpoint: RpcEndpointRef): CoarseMesosSchedulerBackend = {
     val securityManager = mock[SecurityManager]
+
     val backend = new CoarseMesosSchedulerBackend(taskScheduler, sc, "master", securityManager) {
       override protected def createSchedulerDriver(
-        masterUrl: String,
-        scheduler: Scheduler,
-        sparkUser: String,
-        appName: String,
-        conf: SparkConf,
-        webuiUrl: Option[String] = None,
-        checkpoint: Option[Boolean] = None,
-        failoverTimeout: Option[Double] = None,
-        frameworkId: Option[String] = None): SchedulerDriver = driver
+          masterUrl: String,
+          scheduler: Scheduler,
+          sparkUser: String,
+          appName: String,
+          conf: SparkConf,
+          webuiUrl: Option[String] = None,
+          checkpoint: Option[Boolean] = None,
+          failoverTimeout: Option[Double] = None,
+          frameworkId: Option[String] = None): SchedulerDriver = driver
+
+      override protected def getShuffleClient(): MesosExternalShuffleClient = shuffleClient
+
+      protected def createDriverEndpointRef(
+          properties: ArrayBuffer[(String, String)]): RpcEndpointRef = endpoint
+
+      // override to avoid race condition with the driver thread on `mesosDriver`
+      override def startScheduler(newDriver: SchedulerDriver): Unit = {
+        mesosDriver = newDriver
+      }
+
       markRegistered()
     }
     backend.start()
     backend
   }
 
-  var sparkConf: SparkConf = _
-
-  before {
+  private def setBackend(sparkConfVars: Map[String, String] = null) {
     sparkConf = (new SparkConf)
       .setMaster("local[*]")
       .setAppName("test-mesos-dynamic-alloc")
       .setSparkHome("/path")
+      .set("spark.mesos.driver.webui.url", "http://webui")
+
+    if (sparkConfVars != null) {
+      for (attr <- sparkConfVars) {
+        sparkConf.set(attr._1, attr._2)
+      }
+    }
 
     sc = new SparkContext(sparkConf)
-  }
 
-  test("mesos supports killing and limiting executors") {
-    val driver = mock[SchedulerDriver]
+    driver = mock[SchedulerDriver]
     when(driver.start()).thenReturn(Protos.Status.DRIVER_RUNNING)
-    val taskScheduler = mock[TaskSchedulerImpl]
+    taskScheduler = mock[TaskSchedulerImpl]
     when(taskScheduler.sc).thenReturn(sc)
+    externalShuffleClient = mock[MesosExternalShuffleClient]
+    driverEndpoint = mock[RpcEndpointRef]
 
-    sparkConf.set("spark.driver.host", "driverHost")
-    sparkConf.set("spark.driver.port", "1234")
-
-    val backend = createSchedulerBackend(taskScheduler, driver)
-    val minMem = backend.calculateTotalMemory(sc)
-    val minCpu = 4
-
-    val mesosOffers = new java.util.ArrayList[Offer]
-    mesosOffers.add(createOffer("o1", "s1", minMem, minCpu))
-
-    val taskID0 = TaskID.newBuilder().setValue("0").build()
-
-    backend.resourceOffers(driver, mesosOffers)
-    verify(driver, times(1)).launchTasks(
-      Matchers.eq(Collections.singleton(mesosOffers.get(0).getId)),
-      any[util.Collection[TaskInfo]],
-      any[Filters])
-
-    // simulate the allocation manager down-scaling executors
-    backend.doRequestTotalExecutors(0)
-    assert(backend.doKillExecutors(Seq("s1/0")))
-    verify(driver, times(1)).killTask(taskID0)
-
-    val mesosOffers2 = new java.util.ArrayList[Offer]
-    mesosOffers2.add(createOffer("o2", "s2", minMem, minCpu))
-    backend.resourceOffers(driver, mesosOffers2)
-
-    verify(driver, times(1))
-      .declineOffer(OfferID.newBuilder().setValue("o2").build())
-
-    // Verify we didn't launch any new executor
-    assert(backend.slaveIdsWithExecutors.size === 1)
-
-    backend.doRequestTotalExecutors(2)
-    backend.resourceOffers(driver, mesosOffers2)
-    verify(driver, times(1)).launchTasks(
-      Matchers.eq(Collections.singleton(mesosOffers2.get(0).getId)),
-      any[util.Collection[TaskInfo]],
-      any[Filters])
-
-    assert(backend.slaveIdsWithExecutors.size === 2)
-    backend.slaveLost(driver, SlaveID.newBuilder().setValue("s1").build())
-    assert(backend.slaveIdsWithExecutors.size === 1)
-  }
-
-  test("mesos supports killing and relaunching tasks with executors") {
-    val driver = mock[SchedulerDriver]
-    when(driver.start()).thenReturn(Protos.Status.DRIVER_RUNNING)
-    val taskScheduler = mock[TaskSchedulerImpl]
-    when(taskScheduler.sc).thenReturn(sc)
-
-    val backend = createSchedulerBackend(taskScheduler, driver)
-    val minMem = backend.calculateTotalMemory(sc) + 1024
-    val minCpu = 4
-
-    val mesosOffers = new java.util.ArrayList[Offer]
-    val offer1 = createOffer("o1", "s1", minMem, minCpu)
-    mesosOffers.add(offer1)
-
-    val offer2 = createOffer("o2", "s1", minMem, 1);
-
-    backend.resourceOffers(driver, mesosOffers)
-
-    verify(driver, times(1)).launchTasks(
-      Matchers.eq(Collections.singleton(offer1.getId)),
-      anyObject(),
-      anyObject[Filters])
-
-    // Simulate task killed, executor no longer running
-    val status = TaskStatus.newBuilder()
-      .setTaskId(TaskID.newBuilder().setValue("0").build())
-      .setSlaveId(SlaveID.newBuilder().setValue("s1").build())
-      .setState(TaskState.TASK_KILLED)
-      .build
-
-    backend.statusUpdate(driver, status)
-    assert(!backend.slaveIdsWithExecutors.contains("s1"))
-
-    mesosOffers.clear()
-    mesosOffers.add(offer2)
-    backend.resourceOffers(driver, mesosOffers)
-    assert(backend.slaveIdsWithExecutors.contains("s1"))
-
-    verify(driver, times(1)).launchTasks(
-      Matchers.eq(Collections.singleton(offer2.getId)),
-      anyObject(),
-      anyObject[Filters])
-
-    verify(driver, times(1)).reviveOffers()
+    backend = createSchedulerBackend(taskScheduler, driver, externalShuffleClient, driverEndpoint)
   }
 }
